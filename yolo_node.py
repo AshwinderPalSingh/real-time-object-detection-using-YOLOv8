@@ -11,7 +11,7 @@ from vision_msgs.msg import Detection2D, Detection2DArray, ObjectHypothesisWithP
 # Tool to convert between ROS Image messages and OpenCV images
 from cv_bridge import CvBridge
 
-# OpenCV library
+# OpenCV library (though used less directly now for drawing debug image)
 import cv2
 
 # YOLO library from Ultralytics
@@ -36,12 +36,9 @@ class YoloDetectorNode(Node):
 
         # --- Load Model ---
         # Ensure 'yolov8n.pt' (or specified model) is accessible
-        # Consider making the path relative or using find_package_share if model is packaged
         if not os.path.isabs(model_path):
-             # Basic check if it's just the filename, could be improved
-             # In a real package, you might put models in share/yolo_detector/models
              self.get_logger().info(f"Assuming model '{model_path}' is in current directory or PATH.")
-        
+
         try:
             self.model = YOLO(model_path)
             self.get_logger().info(f'YOLOv8 model loaded successfully from: {model_path}')
@@ -76,37 +73,32 @@ class YoloDetectorNode(Node):
     def image_callback(self, msg: Image):
         self.get_logger().debug('Received image.')
         try:
+            # 1. Convert ROS Image message to OpenCV image (BGR format)
             cv_image = self.bridge.imgmsg_to_cv2(msg, 'bgr8')
         except Exception as e:
             self.get_logger().error(f'Failed to convert image: {e}')
             return
 
-        # Run YOLO inference
+        # 2. Run YOLO inference on the OpenCV image
         try:
-            # Pass confidence threshold to the model prediction
             results = self.model(cv_image, conf=self.confidence_threshold, verbose=False)
         except Exception as e:
             self.get_logger().error(f"Error during YOLO inference: {e}")
             return
 
-        # Prepare messages
+        # --- Prepare messages for publishing ---
         detection_data_msg = Detection2DArray()
-        detection_data_msg.header = msg.header
+        detection_data_msg.header = msg.header # Use header from input image
 
-        # Process results
+        # 3. Process detection results to extract data and fill Detection2DArray
         if results[0].boxes is not None:
             for box in results[0].boxes:
+                # Extract data needed for the /detections topic
                 coords = box.xyxy[0].cpu().numpy()
                 xmin, ymin, xmax, ymax = map(int, coords)
                 confidence = float(box.conf[0].cpu().numpy())
                 cls_id = int(box.cls[0].cpu().numpy())
                 class_name = self.model.names[cls_id]
-
-                # Draw on debug image
-                cv2.rectangle(cv_image, (xmin, ymin), (xmax, ymax), (0, 255, 0), 2)
-                label = f"{class_name}: {confidence:.2f}"
-                cv2.putText(cv_image, label, (xmin, ymin - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
                 # Fill structured data message
                 detection = Detection2D()
@@ -121,15 +113,24 @@ class YoloDetectorNode(Node):
                 hypothesis.hypothesis.score = confidence
                 detection.results.append(hypothesis)
 
+                # Optional: Tracking ID if available
+                # if box.id is not None:
+                #    detection.id = str(int(box.id[0].cpu().numpy()))
+
                 detection_data_msg.detections.append(detection)
 
-        # Publish structured data
+        # 4. Publish the structured detection data
         self.detection_publisher.publish(detection_data_msg)
 
-        # Publish debug image
+        # 5. Generate and publish the debug image using Ultralytics plot() function
         try:
-            debug_image_msg = self.bridge.cv2_to_imgmsg(cv_image, 'bgr8')
-            debug_image_msg.header = msg.header
+            # Use the plot() method from the results object
+            # This returns a NumPy array (BGR) with boxes and labels drawn
+            annotated_frame = results[0].plot()
+
+            # Convert the annotated frame (NumPy array) to a ROS Image message
+            debug_image_msg = self.bridge.cv2_to_imgmsg(annotated_frame, 'bgr8')
+            debug_image_msg.header = msg.header # Ensure header matches original
             self.debug_image_publisher.publish(debug_image_msg)
         except Exception as e:
             self.get_logger().error(f'Failed to publish debug image: {e}')
@@ -137,13 +138,13 @@ class YoloDetectorNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = YoloDetectorNode()
-    if rclpy.ok(): # Check if init was successful before spinning
+    if rclpy.ok(): # Check if init was successful
         try:
             rclpy.spin(node)
         except KeyboardInterrupt:
             node.get_logger().info('Shutting down node...')
         finally:
-            # Ensure destroy_node() is called only if the node was created
+            # Cleanup
             if node and rclpy.ok():
                  node.destroy_node()
                  rclpy.shutdown()
